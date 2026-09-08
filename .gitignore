@@ -1,0 +1,20 @@
+# Secrets and local configuration
+.env
+.env.*
+*.key
+*.pem
+secrets.*
+credentials.*
+
+# PowerShell local files
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Rust build output (for future native Rust version)
+target/
+Cargo.lock
