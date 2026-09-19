@@ -1,10 +1,28 @@
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
+    [Parameter(Mandatory = $false, Position = 0)]
     [string]$Task
 )
 
-$ErrorActionPreference = "Continue"
+try {
+    [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch {}
 
+$ErrorActionPreference = "Continue"
+if ([string]::IsNullOrWhiteSpace($Task)) {
+    Write-Host ""
+    Write-Host "MARGAM: No task was provided."
+    Write-Host "Usage: margam `"your task here`""
+    exit 2
+}
+
+if ($Task.Length -gt 12000) {
+    Write-Host ""
+    Write-Host "MARGAM: Task is too long."
+    Write-Host "Maximum allowed length: 12000 characters."
+    exit 2
+}
 # ============================================================
 # MARGAM - Multi-model AI Router
 # Built on top of Jcode
@@ -21,36 +39,96 @@ function Run-Jcode {
     )
 
     if ($ProviderProfile) {
-        & jcode `
+        $result = & jcode `
             --provider-profile $ProviderProfile `
             --model $Model `
             --tool-profile $ToolProfile `
-            run $Prompt |
-            ForEach-Object { Write-Host $_ }
-
-        return [int]$LASTEXITCODE
+            run --json $Prompt
     }
-
-    if ($Model) {
-        & jcode `
+    elseif ($Model) {
+        $result = & jcode `
             --provider $Provider `
             --model $Model `
             --tool-profile $ToolProfile `
-            run $Prompt |
-            ForEach-Object { Write-Host $_ }
-
-        return [int]$LASTEXITCODE
+            run --json $Prompt
+    }
+    else {
+        $result = & jcode `
+            --provider $Provider `
+            --tool-profile $ToolProfile `
+            run --json $Prompt
     }
 
-    & jcode `
-        --provider $Provider `
-        --tool-profile $ToolProfile `
-        run $Prompt |
-        ForEach-Object { Write-Host $_ }
+    $exitCode = [int]$LASTEXITCODE
 
-    return [int]$LASTEXITCODE
+    if ($exitCode -eq 0 -and $result) {
+        try {
+            $json = $result | ConvertFrom-Json
+
+            if ($json.text) {
+                Write-Host $json.text
+            }
+            else {
+                Write-Host $result
+            }
+        }
+        catch {
+            Write-Host $result
+        }
+    }
+    elseif ($result) {
+        Write-Host $result
+    }
+
+    return $exitCode
 }
 
+function Test-ProviderAvailable {
+    param(
+        [string]$Provider
+    )
+
+    switch ($Provider) {
+        "ollama" {
+            try {
+                $response = Invoke-WebRequest `
+                    -Uri "http://localhost:11434/api/tags" `
+                    -Method Get `
+                    -TimeoutSec 3 `
+                    -UseBasicParsing
+
+                if ($response.StatusCode -eq 200) {
+                    return $true
+                }
+
+                return $false
+            }
+            catch {
+                return $false
+            }
+        }
+
+        "openrouter" {
+            return $true
+        }
+
+        "groq" {
+            return $true
+        }
+
+        "gemini-api" {
+            return $true
+        }
+
+        "openai" {
+            return $true
+        }
+
+        default {
+            return $false
+        }
+    }
+}
 # ============================================================
 # NORMALIZE INPUT
 # ============================================================
@@ -133,6 +211,75 @@ $knowledgeWords = @(
     "tell me about","teach me"
 )
 
+function Test-KeywordMatch {
+    param(
+        [string]$Text,
+        [string[]]$Keywords
+    )
+
+    foreach ($keyword in $Keywords) {
+        $pattern = "(?<![\p{L}\p{N}_])" + [regex]::Escape($keyword) + "(?![\p{L}\p{N}_])"
+
+        if ($Text -match $pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+# ============================================================
+# MODEL CONFIGURATION
+# ============================================================
+
+$config = @{
+    General = @{
+        PrimaryProviderProfile = "local-ollama"
+        PrimaryProvider        = "ollama"
+        PrimaryModel           = "qwen2.5:3b"
+        PrimaryToolProfile     = "none"
+        FallbackProvider       = "openrouter"
+        FallbackModel          = "openrouter/free"
+        FallbackToolProfile    = "none"
+    }
+
+    Knowledge = @{
+        PrimaryProvider        = "openrouter"
+        PrimaryModel           = "openrouter/free"
+        PrimaryToolProfile     = "minimal"
+        FallbackProvider       = "gemini-api"
+        FallbackModel          = "models/gemini-3.6-flash"
+        FallbackToolProfile    = "minimal"
+    }
+
+    Coding = @{
+        PrimaryProvider        = "openrouter"
+        PrimaryModel           = "openrouter/free"
+        PrimaryToolProfile     = "minimal"
+        FallbackProvider       = "groq"
+        FallbackModel          = "openai/gpt-oss-20b"
+        FallbackToolProfile    = "minimal"
+    }
+
+    Agentic = @{
+        PrimaryProvider        = "groq"
+        PrimaryModel           = "openai/gpt-oss-20b"
+        PrimaryToolProfile     = "minimal"
+        FallbackProvider       = "gemini-api"
+        FallbackModel          = "models/gemini-3.6-flash"
+        FallbackToolProfile    = "minimal"
+    }
+
+    Complex = @{
+        PrimaryProvider        = "openai"
+        PrimaryModel           = "gpt-5.6-terra"
+        PrimaryToolProfile     = "minimal"
+        FallbackProvider       = "gemini-api"
+        FallbackModel          = "models/gemini-3.6-flash"
+        FallbackToolProfile    = "minimal"
+    }
+}
+
 # ============================================================
 # DETECTION
 # ============================================================
@@ -143,40 +290,15 @@ $isAgentic = $false
 $isComplex = $false
 $isKnowledge = $false
 
-foreach ($word in $codingWords) {
-    if ($lower.Contains($word)) {
-        $isCoding = $true
-        break
-    }
-}
+$isCoding = Test-KeywordMatch -Text $lower -Keywords $codingWords
 
-foreach ($word in $debugWords) {
-    if ($lower.Contains($word)) {
-        $isDebugging = $true
-        break
-    }
-}
+$isDebugging = Test-KeywordMatch -Text $lower -Keywords $debugWords
 
-foreach ($word in $agentWords) {
-    if ($lower.Contains($word)) {
-        $isAgentic = $true
-        break
-    }
-}
+$isAgentic = Test-KeywordMatch -Text $lower -Keywords $agentWords
 
-foreach ($word in $complexWords) {
-    if ($lower.Contains($word)) {
-        $isComplex = $true
-        break
-    }
-}
+$isComplex = Test-KeywordMatch -Text $lower -Keywords $complexWords
 
-foreach ($word in $knowledgeWords) {
-    if ($lower.Contains($word)) {
-        $isKnowledge = $true
-        break
-    }
-}
+$isKnowledge = Test-KeywordMatch -Text $lower -Keywords $knowledgeWords
 
 # ============================================================
 # CLASSIFICATION
@@ -185,7 +307,7 @@ foreach ($word in $knowledgeWords) {
 if ($isComplex) {
     $TaskType = "Complex"
 }
-elseif ($isCoding -and ($isDebugging -or $isAgentic)) {
+elseif ($isCoding -and $isAgentic -and -not $isDebugging) {
     $TaskType = "Agentic Coding"
 }
 elseif ($isDebugging) {
@@ -239,11 +361,27 @@ User request:
 $Task
 "@
 
-    $exit = Run-Jcode `
-        -ProviderProfile "local-ollama" `
-        -Model "qwen2.5:3b" `
-        -ToolProfile "none" `
-        -Prompt $prompt
+    $cfg = $config.General
+
+        if ($cfg.PrimaryProvider -eq "ollama" -and -not (Test-ProviderAvailable -Provider "ollama")) {
+        Write-Host "[ROUTER] Ollama is unavailable."
+        Write-Host "[ROUTER] Using fallback: $($cfg.FallbackProvider)"
+        Write-Host ""
+
+        $exit = Run-Jcode `
+            -Provider $cfg.FallbackProvider `
+            -Model $cfg.FallbackModel `
+            -ToolProfile $cfg.FallbackToolProfile `
+            -Prompt $prompt
+    }
+    else {
+        $exit = Run-Jcode `
+            -ProviderProfile $cfg.PrimaryProviderProfile `
+            -Provider $cfg.PrimaryProvider `
+            -Model $cfg.PrimaryModel `
+            -ToolProfile $cfg.PrimaryToolProfile `
+            -Prompt $prompt
+    }
 
     if ($exit -ne 0) {
         Write-Host ""
@@ -252,9 +390,9 @@ $Task
         Write-Host ""
 
         $exit = Run-Jcode `
-            -Provider "openrouter" `
-            -Model "minimax/minimax-m2.7:free" `
-            -ToolProfile "none" `
+            -Provider $cfg.FallbackProvider `
+            -Model $cfg.FallbackModel `
+            -ToolProfile $cfg.FallbackToolProfile `
             -Prompt $prompt
     }
 }
@@ -267,7 +405,7 @@ elseif ($TaskType -eq "Knowledge") {
 
     Write-Host "[ROUTER] Strategy  : Knowledge / Free"
     Write-Host "[ROUTER] Primary   : OpenRouter FREE"
-    Write-Host "[ROUTER] Model     : MiniMax M2.7 FREE"
+    Write-Host "[ROUTER] Model     : OpenRouter Free Router"
     Write-Host "[ROUTER] Fallback  : Gemini"
     Write-Host ""
 
@@ -285,10 +423,12 @@ User request:
 $Task
 "@
 
+    $cfg = $config.Knowledge
+
     $exit = Run-Jcode `
-        -Provider "openrouter" `
-        -Model "minimax/minimax-m2.7:free" `
-        -ToolProfile "minimal" `
+        -Provider $cfg.PrimaryProvider `
+        -Model $cfg.PrimaryModel `
+        -ToolProfile $cfg.PrimaryToolProfile `
         -Prompt $prompt
 
     if ($exit -ne 0) {
@@ -298,9 +438,9 @@ $Task
         Write-Host ""
 
         $exit = Run-Jcode `
-            -Provider "gemini-api" `
-            -Model "models/gemini-3.6-flash" `
-            -ToolProfile "minimal" `
+            -Provider $cfg.FallbackProvider `
+            -Model $cfg.FallbackModel `
+            -ToolProfile $cfg.FallbackToolProfile `
             -Prompt $prompt
     }
 }
@@ -313,7 +453,7 @@ elseif ($TaskType -eq "Coding") {
 
     Write-Host "[ROUTER] Strategy  : Programming"
     Write-Host "[ROUTER] Primary   : OpenRouter FREE"
-    Write-Host "[ROUTER] Model     : MiniMax M2.7 FREE"
+    Write-Host "[ROUTER] Model     : OpenRouter Free Router"
     Write-Host "[ROUTER] Fallback  : Groq"
     Write-Host ""
 
@@ -335,10 +475,12 @@ User request:
 $Task
 "@
 
+            $cfg = $config.Coding
+
     $exit = Run-Jcode `
-        -Provider "openrouter" `
-        -Model "minimax/minimax-m2.7:free" `
-        -ToolProfile "minimal" `
+        -Provider $cfg.PrimaryProvider `
+        -Model $cfg.PrimaryModel `
+        -ToolProfile $cfg.PrimaryToolProfile `
         -Prompt $prompt
 
     if ($exit -ne 0) {
@@ -348,13 +490,13 @@ $Task
         Write-Host ""
 
         $exit = Run-Jcode `
-            -Provider "groq" `
-            -Model "openai/gpt-oss-20b" `
-            -ToolProfile "minimal" `
+            -Provider $cfg.FallbackProvider `
+            -Model $cfg.FallbackModel `
+            -ToolProfile $cfg.FallbackToolProfile `
             -Prompt $prompt
     }
 }
-
+# ============================================================
 # ============================================================
 # DEBUGGING / AGENTIC CODING
 # ============================================================
@@ -362,64 +504,88 @@ $Task
 elseif ($TaskType -eq "Debugging" -or $TaskType -eq "Agentic Coding") {
 
     Write-Host "[ROUTER] Strategy  : Coding Agent + Verification"
-    Write-Host "[ROUTER] Primary   : OpenRouter FREE"
-    Write-Host "[ROUTER] Model     : MiniMax M2.7 FREE"
-    Write-Host "[ROUTER] Fallback  : Groq"
+    Write-Host "[ROUTER] Primary   : Groq FREE"
+    Write-Host "[ROUTER] Model     : GPT-OSS-20B"
+    Write-Host "[ROUTER] Fallback  : Gemini"
     Write-Host ""
 
     $prompt = @"
-Act as a careful coding agent.
+Act as a careful coding agent running on Windows 11.
 
-User request:
+ENVIRONMENT:
+- The operating system is Windows 11.
+- Prefer PowerShell or Windows CMD-compatible commands.
+- Do NOT use Linux/macOS-only commands such as find, grep, sed, awk, rm, chmod, or Unix shell syntax.
+- Do NOT assume bash is available.
+- Use Windows-compatible paths and commands.
+- Python is available as `python`.
+- Work only inside the current project/workspace unless the user explicitly requests otherwise.
+
+USER REQUEST:
 
 $Task
 
 WORKFLOW:
 
-1. Inspect relevant files/project structure if available.
-2. Understand the existing implementation before changing it.
-3. Identify the root cause or exact requested modification.
-4. Make the smallest safe changes.
+1. Inspect the relevant files and project structure before making changes.
+2. Understand the existing implementation before modifying it.
+3. Identify the exact requested change or root cause.
+4. Make the smallest safe change necessary.
 5. Preserve unrelated functionality.
-6. Check syntax and logic.
-7. Run relevant tests or validation commands when possible.
-8. If something fails, diagnose and fix it.
-9. Verify that the requested result actually works.
-10. Report:
-   - changes made
-   - tests/validation performed
-   - verification result
-   - remaining problems, if any
+6. Do not overwrite or delete unrelated files.
+7. Check syntax and logic after editing.
+8. Prefer non-interactive tests whenever possible.
+9. Never run a command that waits for user input unless the user explicitly requested an interactive program.
+10. For Python programs, prefer non-interactive validation such as:
+    python -c "..."
+    or a test script with predefined inputs.
+11. Run relevant tests or validation commands when possible.
+12. If a command fails, diagnose the failure and try a Windows-compatible alternative.
+13. If a tool or command is unavailable, do not repeatedly retry it; use an appropriate alternative.
+14. Verify that the requested result actually works.
+15. Do NOT create Git commits, push to GitHub, reset branches, or alter Git history unless the user explicitly asks for Git operations.
+16. Do not claim a test passed unless you actually ran it and observed the result.
 
 SAFETY:
 
-- Never reveal API keys, passwords, tokens, or secrets.
+- Never reveal API keys, passwords, tokens, or other secrets.
+- Do not expose secret values found in files or environment variables.
 - Do not perform unrelated destructive operations.
 - Do not overwrite unrelated files.
 - Ask before making major ambiguous changes.
+- Keep changes focused on the user's request.
+
+FINAL REPORT:
+
+Report briefly:
+- Changes made
+- Tests/validation performed
+- Verification result
+- Remaining problems, if any
 "@
 
+        $cfg = $config.Agentic
+
     $exit = Run-Jcode `
-        -Provider "openrouter" `
-        -Model "minimax/minimax-m2.7:free" `
-        -ToolProfile "minimal" `
+        -Provider $cfg.PrimaryProvider `
+        -Model $cfg.PrimaryModel `
+        -ToolProfile $cfg.PrimaryToolProfile `
         -Prompt $prompt
 
     if ($exit -ne 0) {
         Write-Host ""
-        Write-Host "[ROUTER] OpenRouter failed."
-        Write-Host "[ROUTER] Fallback  : Groq"
+        Write-Host "[ROUTER] Groq failed."
+        Write-Host "[ROUTER] Fallback  : Gemini"
         Write-Host ""
 
         $exit = Run-Jcode `
-            -Provider "groq" `
-            -Model "openai/gpt-oss-20b" `
-            -ToolProfile "minimal" `
+            -Provider $cfg.FallbackProvider `
+            -Model $cfg.FallbackModel `
+            -ToolProfile $cfg.FallbackToolProfile `
             -Prompt $prompt
     }
 }
 
-# ============================================================
 # COMPLEX
 # ============================================================
 
@@ -458,10 +624,12 @@ User request:
 $Task
 "@
 
+        $cfg = $config.Complex
+
     $exit = Run-Jcode `
-        -Provider "openai" `
-        -Model "gpt-5.6-terra" `
-        -ToolProfile "minimal" `
+        -Provider $cfg.PrimaryProvider `
+        -Model $cfg.PrimaryModel `
+        -ToolProfile $cfg.PrimaryToolProfile `
         -Prompt $prompt
 
     if ($exit -ne 0) {
@@ -471,9 +639,9 @@ $Task
         Write-Host ""
 
         $exit = Run-Jcode `
-            -Provider "gemini-api" `
-            -Model "models/gemini-3.6-flash" `
-            -ToolProfile "minimal" `
+            -Provider $cfg.FallbackProvider `
+            -Model $cfg.FallbackModel `
+            -ToolProfile $cfg.FallbackToolProfile `
             -Prompt $prompt
     }
 }
